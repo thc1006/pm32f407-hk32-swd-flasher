@@ -1,0 +1,41 @@
+# Build artifacts
+firmware/build/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+logs/
+*.log
+
+# Large vendor material — keep local, never commit
+vendor/
+*.pack
+*.PACK
+*.pdf
+*.PDF
+hk32_sdk/
+
+# Local J-Link artifacts
+JLinkLog.txt
+*.jlink.bak
