@@ -15,6 +15,7 @@
      [8] marker_end  0xBEEFDEAD (sequence finished)
 */
 #include <stdint.h>
+#include "target.h"
 
 /* PM32F407 peripheral map (STM32F407-compatible) */
 #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
@@ -296,6 +297,22 @@ int main(void) {
     /* Read FLASH_CR again — if unlock worked, LOCK bit (7) should be 0 */
     flash_cr = swd_ap_mem_read(0x40022010, &at, &ad, &ar);
     g_result[14] = flash_cr;                      /* expect bit 7 = 0 after unlock */
+
+    /* Verify FLASH_CR.LOCK actually cleared. Per STM32F0 RM (§3.5.1 FPEC access
+     * unlocking) KEY1/KEY2 must be written in strict order; any intervening
+     * transaction, a dropped WAIT ACK that re-ordered our writes, or a typo in
+     * the key sequence leaves LOCK=1. Once in that state, every subsequent CR
+     * write is silently ignored — erase and program will appear to "succeed"
+     * on the wire (ACK=OK) but leave Flash untouched, producing a confusing
+     * "readback is 0xFFFFFFFF" failure far from the actual cause. Bail now. */
+    if (flash_cr & TGT_FLASH_CR_LOCK) {
+        /* Sentinel in g_result[15] (normally holds sr_prog) that tells the
+         * operator this run aborted before touching Flash. Low 16 bits carry
+         * the observed FLASH_CR so the LOCK bit is visible without separate
+         * inspection. */
+        g_result[15] = 0xDEAD0000u | (flash_cr & 0xFFFFu);
+        while (1) { __asm__ volatile("nop"); }
+    }
 
     /* 12. ERASE page 0 of Flash, with SR checks between each step */
 
