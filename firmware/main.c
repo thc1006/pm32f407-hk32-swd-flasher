@@ -118,9 +118,13 @@ static uint8_t swd_request(int apndp, int rnw, int addr23) {
 #define SWD_ACK_OK      0x1
 #define SWD_ACK_WAIT    0x2
 #define SWD_ACK_FAULT   0x4
-#define SWD_MAX_WAIT_RETRIES 8
+#define SWD_MAX_WAIT_RETRIES        8
+#define SWD_WAIT_RETRY_IDLE_CYCLES  4   /* brief idle between WAIT retries */
 
-/* Internal: single SWD read attempt (no retry). */
+/* Internal: single SWD read attempt (no retry). On non-OK ACK, the 32 data
+   bits clocked after ACK are not meaningful per ADIv5, so we leave *data_out
+   unchanged — avoids leaking undefined bits to callers that forget to gate
+   on the return value. */
 static uint32_t swd_read_txn_once(int apndp, int addr23, uint32_t *data_out) {
     uint8_t req = swd_request(apndp, 1, addr23);
     swdio_output();
@@ -133,7 +137,9 @@ static uint32_t swd_read_txn_once(int apndp, int addr23, uint32_t *data_out) {
     swdio_output();
     swdio_low();
     swd_clk();
-    *data_out = data;
+    if (ack == SWD_ACK_OK) {
+        *data_out = data;
+    }
     return ack;
 }
 
@@ -145,7 +151,7 @@ static uint32_t swd_read_txn(int apndp, int addr23, uint32_t *data_out) {
         if (ack != SWD_ACK_WAIT) return ack;
         /* Brief idle before retrying so target can finish internal bookkeeping */
         swdio_output(); swdio_low();
-        for (int j = 0; j < 4; j++) swd_clk();
+        for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
     }
     return SWD_ACK_WAIT;
 }
@@ -178,7 +184,7 @@ static uint32_t swd_write_txn(int apndp, int addr23, uint32_t data) {
         uint32_t ack = swd_write_txn_raw(apndp, addr23, wire_data, parity_bit, real_parity);
         if (ack != SWD_ACK_WAIT) return ack;
         swdio_output(); swdio_low();
-        for (int j = 0; j < 4; j++) swd_clk();
+        for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
     }
     return SWD_ACK_WAIT;
 }
