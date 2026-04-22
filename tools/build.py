@@ -24,7 +24,7 @@ GCC = f"{TOOLCHAIN}/arm-none-eabi-gcc"
 OBJCOPY = f"{TOOLCHAIN}/arm-none-eabi-objcopy"
 SIZE = f"{TOOLCHAIN}/arm-none-eabi-size"
 
-SOURCES = ["startup.c", "main.c"]
+SOURCES = ["startup.c", "main.c", "target_blob.c"]
 CFLAGS = [
     "-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=soft",
     "-Os", "-ffunction-sections", "-fdata-sections",
