@@ -239,21 +239,26 @@ static void swd_idle(int n) {
     for (int i = 0; i < n; i++) swd_clk();
 }
 
-/* AP memory read — "double DRW" pattern used by pyOCD/OpenOCD:
-   1st DRW read: posts request, returns stale (junk).
-   2nd DRW read: returns fetched data AND posts next.
-   DP RDBUFF alternative gives last fetched data without posting.
-   We try double-DRW here: first read discarded, second has data. */
-static uint32_t swd_ap_mem_read(uint32_t addr, uint32_t *ack_tar, uint32_t *ack_drw1, uint32_t *ack_drw2) {
+/* AP memory read — canonical ADIv5 "post + RDBUFF" pattern.
+   1) Write AP TAR with target address.
+   2) Read AP DRW — posts the memory fetch; returned data is from the PREVIOUS
+      AP access (stale / undefined on first access of a session per ADIv5).
+   3) Read DP RDBUFF — returns the just-fetched value WITHOUT triggering a new
+      AP access. This is what we want for point reads.
+   Older versions of this function did a second AP DRW read instead, which
+   also "worked" because our CSW has AddrInc off (second post re-fetches the
+   same address), but it's a wasted transaction and is wrong the moment
+   AddrInc gets enabled for bulk reads later. */
+static uint32_t swd_ap_mem_read(uint32_t addr, uint32_t *ack_tar, uint32_t *ack_drw, uint32_t *ack_rdbuff) {
     uint32_t data = 0;
 
     *ack_tar = swd_write_txn(1, 0b01, addr);
     swd_idle(8);
 
-    *ack_drw1 = swd_read_txn(1, 0b11, &data);
+    *ack_drw = swd_read_txn(1, 0b11, &data);    /* posts fetch; returns stale */
     swd_idle(8);
 
-    *ack_drw2 = swd_read_txn(1, 0b11, &data);   /* Second DRW read returns fetched data */
+    *ack_rdbuff = swd_read_txn(0, 0b11, &data); /* DP RDBUFF returns fetched value */
     swd_idle(8);
 
     return data;
