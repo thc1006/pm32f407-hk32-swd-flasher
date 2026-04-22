@@ -282,6 +282,17 @@ int main(void) {
     uint32_t flash_cr = swd_ap_mem_read(0x40022010, &at, &ad, &ar);
     g_result[13] = flash_cr;                      /* bit 7 = LOCK */
 
+    /* 10b. HALT target CPU via DHCSR (0xE000EDF0) before any Flash operation.
+       DHCSR = DBGKEY (0xA05F0000) | C_HALT (bit 1) | C_DEBUGEN (bit 0) = 0xA05F0003.
+       Without this, target CPU continues executing vendor firmware while we erase
+       its Flash — if it fetches from a page mid-erase the chip will hardfault and
+       the SWD state may wedge. Known issue C1. */
+    swd_write_txn(1, 0b01, 0xE000EDF0);           /* AP TAR = DHCSR address */
+    swd_idle(8);
+    swd_write_txn(1, 0b11, 0xA05F0003);           /* AP DRW = halt command */
+    swd_idle(16);
+    delay_busy(10000);                            /* ~600us for halt to propagate */
+
     /* 11. Try FLASH unlock: write KEY1, KEY2 to FLASH_KEYR @ 0x40022004 */
     swd_write_txn(1, 0b01, 0x40022004);           /* AP TAR = KEYR */
     swd_idle(8);
