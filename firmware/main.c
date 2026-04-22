@@ -25,9 +25,15 @@
      [18] flash_op_status   H3 status code: 0x0000_0001 OK, 0x8000_00EE erase
                             failed (XX = sr bits), 0x4000_00EE program failed
      [19] aircr_reset_acks  H4: SYSRESETREQ write ACKs — (tar<<16 | drw<<24)
+     [20] hwcount           H5: halfword count attempted (from TARGET_BLOB_BYTES)
+     [21] pages_erased      H5: page erases that completed OK
+     [22] verify_mismatches H5: readback halfwords that didn't match blob
+     [23] first_mismatch    H5: index of first mismatch (0xFFFFFFFF if none)
 */
+#include <stddef.h>
 #include <stdint.h>
 #include "target.h"
+#include "target_blob.h"
 
 /* PM32F407 peripheral map (STM32F407-compatible) */
 #define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830)
@@ -42,8 +48,9 @@
 #define SWCLK_MASK  (1u << SWCLK_PIN)
 
 /* Results — placed in .bss, accessible via J-Link at 0x20000000 + offset.
-   Slots 13+ were colliding in the earlier monolithic version; expanded to 20. */
-volatile uint32_t g_result[20] __attribute__((used));
+   Slots 13+ were colliding in the earlier monolithic version; expanded to 24
+   so H5 can carry its four summary values without collision. */
+volatile uint32_t g_result[24] __attribute__((used));
 
 /* ---------- low-level GPIO + SWD bit-bang ---------- */
 
@@ -278,6 +285,63 @@ static uint32_t swd_ap_mem_read(uint32_t addr, uint32_t *ack_tar, uint32_t *ack_
     return data;
 }
 
+/* ---------- Flash programming helpers (H5) ---------- */
+
+/* Poll FLASH_SR until BSY=0 or loop budget exhausted. *bsy_cleared flags
+ * whether BSY was actually observed clear (vs. timed out). Caller MUST
+ * check it before treating the op as complete. */
+static uint32_t flash_poll_sr_until_not_bsy(int *bsy_cleared) {
+    uint32_t sr = 0;
+    uint32_t at, ad, ar;
+    int cleared = 0;
+    for (int i = 0; i < 50000; i++) {
+        sr = swd_ap_mem_read(TGT_FLASH_SR, &at, &ad, &ar);
+        if ((sr & TGT_FLASH_SR_BSY) == 0) { cleared = 1; break; }
+    }
+    if (bsy_cleared) *bsy_cleared = cleared;
+    return sr;
+}
+
+/* Non-zero iff caller should treat the op as failed. */
+static inline uint32_t flash_op_failure(uint32_t sr, int bsy_cleared) {
+    uint32_t bad = sr & (TGT_FLASH_SR_PGERR | TGT_FLASH_SR_WRPERR);
+    if (!bsy_cleared) bad |= TGT_FLASH_SR_BSY;
+    return bad;
+}
+
+/* Erase one 1 KB page. CSW must already be WORD. Leaves CR zeroed. */
+static uint32_t flash_erase_page(uint32_t page_addr, int *bsy_cleared) {
+    swd_write_txn(1, 0b01, TGT_FLASH_CR);
+    swd_write_txn(1, 0b11, TGT_FLASH_CR_PER);
+    swd_idle(8);
+    swd_write_txn(1, 0b01, TGT_FLASH_AR);
+    swd_write_txn(1, 0b11, page_addr);
+    swd_idle(8);
+    swd_write_txn(1, 0b01, TGT_FLASH_CR);
+    swd_write_txn(1, 0b11, TGT_FLASH_CR_PER | TGT_FLASH_CR_STRT);
+    swd_idle(8);
+    uint32_t sr = flash_poll_sr_until_not_bsy(bsy_cleared);
+    swd_write_txn(1, 0b01, TGT_FLASH_CR);
+    swd_write_txn(1, 0b11, 0);
+    swd_idle(8);
+    return sr;
+}
+
+/* Program one halfword. CSW must already be HALFWORD. Leaves CR zeroed. */
+static uint32_t flash_program_hw(uint32_t addr, uint16_t hw, int *bsy_cleared) {
+    swd_write_txn(1, 0b01, TGT_FLASH_CR);
+    swd_write_txn(1, 0b11, TGT_FLASH_CR_PG);
+    swd_idle(8);
+    swd_write_txn(1, 0b01, addr);
+    swd_write_txn(1, 0b11, (uint32_t)hw);
+    swd_idle(8);
+    uint32_t sr = flash_poll_sr_until_not_bsy(bsy_cleared);
+    swd_write_txn(1, 0b01, TGT_FLASH_CR);
+    swd_write_txn(1, 0b11, 0);
+    swd_idle(8);
+    return sr;
+}
+
 /* ---------- main ---------- */
 
 static inline void delay_busy(volatile uint32_t n) {
@@ -427,98 +491,116 @@ int main(void) {
         while (1) { __asm__ volatile("nop"); }
     }
 
-    /* 12. ERASE page 0 of Flash, with SR checks between each step */
-
-    /* Read FLASH_SR pre-erase */
-    uint32_t sr_pre = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
-
-    /* Set CR.PER (bit 1) */
-    swd_write_txn(1, 0b01, 0x40022010);
-    swd_write_txn(1, 0b11, 0x00000002);
-    swd_idle(8);
-
-    /* Set FLASH_AR */
-    swd_write_txn(1, 0b01, 0x40022014);
-    swd_write_txn(1, 0b11, 0x08000000);
-    swd_idle(8);
-
-    /* Set CR = PER | STRT (0x42) */
-    swd_write_txn(1, 0b01, 0x40022010);
-    swd_write_txn(1, 0b11, 0x00000042);
-    swd_idle(8);
-    delay_busy(100000);   /* Flash erase can take ms */
-
-    /* Poll BSY — bounded so a hung FPEC doesn't freeze us. Track whether BSY
-     * was actually observed clear; a timeout counts as erase-failed. */
-    uint32_t sr_erase = 0;
-    int erase_bsy_cleared = 0;
-    for (int i = 0; i < 50000; i++) {
-        sr_erase = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
-        if ((sr_erase & TGT_FLASH_SR_BSY) == 0) { erase_bsy_cleared = 1; break; }
+    /* 12. H5: erase enough pages to hold the full TARGET_BLOB (1 KB per page).
+     *     Halfword count rounded up so an odd trailing byte still lands in a
+     *     fully erased page. Bail on first erase failure so we don't program
+     *     over a bad erase. */
+    uint32_t hwcount = (TARGET_BLOB_BYTES + 1u) / 2u;
+    uint32_t pages_needed =
+        (TARGET_BLOB_BYTES + TGT_FLASH_PAGE_SIZE - 1) / TGT_FLASH_PAGE_SIZE;
+    uint32_t pages_erased = 0;
+    uint32_t erase_errs = 0;
+    uint32_t last_sr_erase = 0;
+    for (uint32_t p = 0; p < pages_needed; p++) {
+        uint32_t page_addr = TARGET_BLOB_ADDR + p * TGT_FLASH_PAGE_SIZE;
+        int bsy_cleared = 0;
+        last_sr_erase = flash_erase_page(page_addr, &bsy_cleared);
+        erase_errs = flash_op_failure(last_sr_erase, bsy_cleared);
+        if (erase_errs) break;
+        pages_erased++;
     }
-    g_result[15] = sr_erase;   /* expect EOP=bit5=1, BSY=0 */
-
-    /* H3: check PGERR/WRPERR + BSY timeout. If any set, do not program
-     * over a bad erase — record fail code in g_result[18] and skip ahead. */
-    uint32_t erase_errs = sr_erase & (TGT_FLASH_SR_PGERR | TGT_FLASH_SR_WRPERR);
-    if (!erase_bsy_cleared) erase_errs |= TGT_FLASH_SR_BSY;
+    g_result[15] = last_sr_erase;
+    g_result[20] = hwcount;
+    g_result[21] = pages_erased;
+    g_result[22] = 0;
+    g_result[23] = 0xFFFFFFFFu;
     g_result[18] = 0;
-
-    /* Clear CR */
-    swd_write_txn(1, 0b01, 0x40022010);
-    swd_write_txn(1, 0b11, 0x00000000);
-    swd_idle(8);
 
     uint32_t sr_prog = 0;
     uint32_t prog_errs = 0;
 
     if (erase_errs != 0) {
-        /* Erase failed — skip program + readback. */
+        /* Erase failed — skip program + verify. */
         g_result[18] = 0x80000000u | ((erase_errs & 0xFFu) << 8);
         g_result[16] = 0xDEADDEADu;
         g_result[17] = 0xDEADDEADu;
     } else {
-        /* 13. Switch AP CSW to HALFWORD (Size=001) — STM32F0 requires halfword writes to Flash */
+        /* 13. Switch AP CSW to HALFWORD — STM32F0 requires halfword program. */
         swd_write_txn(1, 0b00, 0x00000001);
         swd_idle(8);
 
-        /* Set CR.PG (bit 0) */
-        swd_write_txn(1, 0b01, 0x40022010);
-        swd_write_txn(1, 0b11, 0x00000001);
-        swd_idle(8);
-
-        /* Write halfword 0x1234 at Flash[0] */
-        swd_write_txn(1, 0b01, 0x08000000);
-        swd_write_txn(1, 0b11, 0x00001234);
-        swd_idle(8);
-        delay_busy(10000);
-
-        /* Poll BSY with timeout detection */
-        int prog_bsy_cleared = 0;
-        for (int i = 0; i < 50000; i++) {
-            sr_prog = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
-            if ((sr_prog & TGT_FLASH_SR_BSY) == 0) { prog_bsy_cleared = 1; break; }
+        /* 14. Loop halfword-program across blob. Each halfword is composed
+         *     from TWO bytes little-endian; odd trailing byte pads 0xFF. */
+        for (uint32_t i = 0; i < hwcount; i++) {
+            uint32_t byte_idx = i * 2u;
+            uint16_t lo = TARGET_BLOB[byte_idx];
+            uint16_t hi = (byte_idx + 1u < TARGET_BLOB_BYTES)
+                          ? TARGET_BLOB[byte_idx + 1u]
+                          : 0xFFu;
+            uint16_t hw = (uint16_t)(lo | (hi << 8));
+            int bsy_cleared = 0;
+            sr_prog = flash_program_hw(TARGET_BLOB_ADDR + byte_idx, hw, &bsy_cleared);
+            prog_errs = flash_op_failure(sr_prog, bsy_cleared);
+            if (prog_errs) {
+                g_result[23] = i;
+                break;
+            }
         }
-        prog_errs = sr_prog & (TGT_FLASH_SR_PGERR | TGT_FLASH_SR_WRPERR);
-        if (!prog_bsy_cleared) prog_errs |= TGT_FLASH_SR_BSY;
-
-        /* Clear CR */
-        swd_write_txn(1, 0b01, 0x40022010);
-        swd_write_txn(1, 0b11, 0x00000000);
-        swd_idle(8);
 
         /* Switch CSW back to WORD for readback */
         swd_write_txn(1, 0b00, 0x00000002);
         swd_idle(8);
 
-        /* 14. Read Flash[0] back — expect 0xFFFF1234 */
-        g_result[16] = swd_ap_mem_read(0x08000000, &at, &ad, &ar);
-
-        /* 15. Final FLASH_SR */
         g_result[17] = sr_prog;
-
-        /* H3: encode program-phase result */
         g_result[18] = prog_errs ? (0x40000000u | (prog_errs & 0xFFu)) : 0x00000001u;
+
+        if (!prog_errs) {
+            /* 15. Verify: walk blob word-at-a-time so each target word is
+             *     fetched once. Compare both halfwords against the source. */
+            uint32_t mismatches = 0;
+            uint32_t first_mismatch = 0xFFFFFFFFu;
+            uint32_t i = 0;
+            while (i + 1u < hwcount) {
+                uint32_t word_addr = TARGET_BLOB_ADDR + i * 2u;
+                uint32_t w = swd_ap_mem_read(word_addr, &at, &ad, &ar);
+                uint16_t want_lo = (uint16_t)TARGET_BLOB[i * 2u]
+                                 | (uint16_t)(TARGET_BLOB[i * 2u + 1u] << 8);
+                uint16_t want_hi = (uint16_t)TARGET_BLOB[(i + 1u) * 2u]
+                                 | (uint16_t)(TARGET_BLOB[(i + 1u) * 2u + 1u] << 8);
+                uint16_t got_lo = (uint16_t)(w & 0xFFFFu);
+                uint16_t got_hi = (uint16_t)(w >> 16);
+                if (got_lo != want_lo) {
+                    mismatches++;
+                    if (first_mismatch == 0xFFFFFFFFu) first_mismatch = i;
+                }
+                if (got_hi != want_hi) {
+                    mismatches++;
+                    if (first_mismatch == 0xFFFFFFFFu) first_mismatch = i + 1u;
+                }
+                i += 2u;
+            }
+            if (i < hwcount) {
+                /* Odd trailing halfword in low half of its word. */
+                uint32_t word_addr = TARGET_BLOB_ADDR + i * 2u;
+                uint32_t w = swd_ap_mem_read(word_addr, &at, &ad, &ar);
+                uint32_t byte_idx = i * 2u;
+                uint16_t want = (uint16_t)TARGET_BLOB[byte_idx]
+                              | (uint16_t)((byte_idx + 1u < TARGET_BLOB_BYTES
+                                            ? TARGET_BLOB[byte_idx + 1u] : 0xFFu) << 8);
+                uint16_t got = (uint16_t)(w & 0xFFFFu);
+                if (got != want) {
+                    mismatches++;
+                    if (first_mismatch == 0xFFFFFFFFu) first_mismatch = i;
+                }
+            }
+            g_result[16] = (hwcount > 0)
+                ? swd_ap_mem_read(TARGET_BLOB_ADDR, &at, &ad, &ar)
+                : 0u;
+            g_result[22] = mismatches;
+            g_result[23] = first_mismatch;
+        } else {
+            g_result[16] = 0xDEADDEADu;
+        }
     }
 
     /* H4: soft-reset the target so it starts running the new firmware. Without
