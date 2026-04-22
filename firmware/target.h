@@ -50,6 +50,7 @@
 #define TGT_DHCSR_DBGKEY    0xA05F0000
 #define TGT_DHCSR_C_HALT    (1u << 1)
 #define TGT_DHCSR_C_DEBUGEN (1u << 0)
+#define TGT_DHCSR_S_HALT    (1u << 17)  /* RO: core currently halted */
 
 /* ARM ADIv5 expected constants */
 #define EXPECTED_DP_IDCODE  0x0BB11477  /* Cortex-M0 SW-DP v1 */

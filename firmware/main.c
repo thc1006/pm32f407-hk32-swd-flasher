@@ -364,6 +364,25 @@ int main(void) {
     uint32_t flash_cr = swd_ap_mem_read(0x40022010, &at, &ad, &ar);
     g_result[13] = flash_cr;                      /* bit 7 = LOCK */
 
+    /* 10b. HALT target CPU via DHCSR before any Flash operation. Without this,
+       target CPU continues executing vendor firmware while we erase its Flash —
+       if it fetches from a page mid-erase the chip will hardfault and the SWD
+       state may wedge. Known issue C1. */
+    swd_write_txn(1, 0b01, TGT_DHCSR);
+    swd_idle(8);
+    swd_write_txn(1, 0b11, TGT_DHCSR_DBGKEY | TGT_DHCSR_C_HALT | TGT_DHCSR_C_DEBUGEN);
+    swd_idle(16);
+
+    /* Poll DHCSR.S_HALT (bit 17) until the core reports halted, with a bounded
+       retry count so a disconnected / stuck target doesn't freeze us. Each
+       iteration costs one AP memory read over bit-banged SWD (~50 µs), so
+       2000 iterations gives us ~100 ms — plenty for the CPU to finish its
+       current instruction and enter halt. */
+    for (int i = 0; i < 2000; i++) {
+        uint32_t dhcsr_rb = swd_ap_mem_read(TGT_DHCSR, &at, &ad, &ar);
+        if (dhcsr_rb & TGT_DHCSR_S_HALT) break;
+    }
+
     /* 11. Try FLASH unlock: write KEY1, KEY2 to FLASH_KEYR @ 0x40022004 */
     swd_write_txn(1, 0b01, 0x40022004);           /* AP TAR = KEYR */
     swd_idle(8);
