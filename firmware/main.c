@@ -22,7 +22,9 @@
      [15] sr_after_erase  FLASH_SR after page erase (expect EOP bit 5 set)
      [16] flash_readback  Flash[0] after program (expect 0xFFFF1234)
      [17] sr_after_program FLASH_SR after halfword program
-     [18..19] reserved
+     [18] flash_op_status   H3 status code: 0x0000_0001 OK, 0x8000_00EE erase
+                            failed (XX = sr bits), 0x4000_00EE program failed
+     [19] reserved
 */
 #include <stdint.h>
 #include "target.h"
@@ -446,55 +448,78 @@ int main(void) {
     swd_idle(8);
     delay_busy(100000);   /* Flash erase can take ms */
 
-    /* Poll BSY */
+    /* Poll BSY — bounded so a hung FPEC doesn't freeze us. Track whether BSY
+     * was actually observed clear; a timeout counts as erase-failed. */
     uint32_t sr_erase = 0;
+    int erase_bsy_cleared = 0;
     for (int i = 0; i < 50000; i++) {
         sr_erase = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
-        if ((sr_erase & 1) == 0) break;
+        if ((sr_erase & TGT_FLASH_SR_BSY) == 0) { erase_bsy_cleared = 1; break; }
     }
     g_result[15] = sr_erase;   /* expect EOP=bit5=1, BSY=0 */
 
+    /* H3: check PGERR/WRPERR + BSY timeout. If any set, do not program
+     * over a bad erase — record fail code in g_result[18] and skip ahead. */
+    uint32_t erase_errs = sr_erase & (TGT_FLASH_SR_PGERR | TGT_FLASH_SR_WRPERR);
+    if (!erase_bsy_cleared) erase_errs |= TGT_FLASH_SR_BSY;
+    g_result[18] = 0;
+
     /* Clear CR */
     swd_write_txn(1, 0b01, 0x40022010);
     swd_write_txn(1, 0b11, 0x00000000);
     swd_idle(8);
 
-    /* 13. Switch AP CSW to HALFWORD (Size=001) — STM32F0 requires halfword writes to Flash */
-    swd_write_txn(1, 0b00, 0x00000001);
-    swd_idle(8);
-
-    /* Set CR.PG (bit 0) */
-    swd_write_txn(1, 0b01, 0x40022010);
-    swd_write_txn(1, 0b11, 0x00000001);
-    swd_idle(8);
-
-    /* Write halfword 0x1234 at Flash[0] */
-    swd_write_txn(1, 0b01, 0x08000000);
-    swd_write_txn(1, 0b11, 0x00001234);
-    swd_idle(8);
-    delay_busy(10000);
-
-    /* Poll BSY */
     uint32_t sr_prog = 0;
-    for (int i = 0; i < 50000; i++) {
-        sr_prog = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
-        if ((sr_prog & 1) == 0) break;
+    uint32_t prog_errs = 0;
+
+    if (erase_errs != 0) {
+        /* Erase failed — skip program + readback. */
+        g_result[18] = 0x80000000u | ((erase_errs & 0xFFu) << 8);
+        g_result[16] = 0xDEADDEADu;
+        g_result[17] = 0xDEADDEADu;
+    } else {
+        /* 13. Switch AP CSW to HALFWORD (Size=001) — STM32F0 requires halfword writes to Flash */
+        swd_write_txn(1, 0b00, 0x00000001);
+        swd_idle(8);
+
+        /* Set CR.PG (bit 0) */
+        swd_write_txn(1, 0b01, 0x40022010);
+        swd_write_txn(1, 0b11, 0x00000001);
+        swd_idle(8);
+
+        /* Write halfword 0x1234 at Flash[0] */
+        swd_write_txn(1, 0b01, 0x08000000);
+        swd_write_txn(1, 0b11, 0x00001234);
+        swd_idle(8);
+        delay_busy(10000);
+
+        /* Poll BSY with timeout detection */
+        int prog_bsy_cleared = 0;
+        for (int i = 0; i < 50000; i++) {
+            sr_prog = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
+            if ((sr_prog & TGT_FLASH_SR_BSY) == 0) { prog_bsy_cleared = 1; break; }
+        }
+        prog_errs = sr_prog & (TGT_FLASH_SR_PGERR | TGT_FLASH_SR_WRPERR);
+        if (!prog_bsy_cleared) prog_errs |= TGT_FLASH_SR_BSY;
+
+        /* Clear CR */
+        swd_write_txn(1, 0b01, 0x40022010);
+        swd_write_txn(1, 0b11, 0x00000000);
+        swd_idle(8);
+
+        /* Switch CSW back to WORD for readback */
+        swd_write_txn(1, 0b00, 0x00000002);
+        swd_idle(8);
+
+        /* 14. Read Flash[0] back — expect 0xFFFF1234 */
+        g_result[16] = swd_ap_mem_read(0x08000000, &at, &ad, &ar);
+
+        /* 15. Final FLASH_SR */
+        g_result[17] = sr_prog;
+
+        /* H3: encode program-phase result */
+        g_result[18] = prog_errs ? (0x40000000u | (prog_errs & 0xFFu)) : 0x00000001u;
     }
-
-    /* Clear CR */
-    swd_write_txn(1, 0b01, 0x40022010);
-    swd_write_txn(1, 0b11, 0x00000000);
-    swd_idle(8);
-
-    /* Switch CSW back to WORD for readback */
-    swd_write_txn(1, 0b00, 0x00000002);
-    swd_idle(8);
-
-    /* 14. Read Flash[0] back — expect 0xFFFF1234 (0x1234 in low halfword, erased 0xFFFF upper) */
-    g_result[16] = swd_ap_mem_read(0x08000000, &at, &ad, &ar);
-
-    /* 15. Final FLASH_SR */
-    g_result[17] = sr_prog;
 
     /* Idle loop */
     while (1) { __asm__ volatile("nop"); }
