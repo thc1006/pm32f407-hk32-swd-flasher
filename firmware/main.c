@@ -24,7 +24,7 @@
      [17] sr_after_program FLASH_SR after halfword program
      [18] flash_op_status   H3 status code: 0x0000_0001 OK, 0x8000_00EE erase
                             failed (XX = sr bits), 0x4000_00EE program failed
-     [19] reserved
+     [19] aircr_reset_acks  H4: SYSRESETREQ write ACKs — (tar<<16 | drw<<24)
 */
 #include <stdint.h>
 #include "target.h"
@@ -520,6 +520,19 @@ int main(void) {
         /* H3: encode program-phase result */
         g_result[18] = prog_errs ? (0x40000000u | (prog_errs & 0xFFu)) : 0x00000001u;
     }
+
+    /* H4: soft-reset the target so it starts running the new firmware. Without
+     * this the Cortex-M0 keeps executing whatever instruction fetch it cached
+     * before we rewrote Flash. swd_write_txn still clocks the 3-bit ACK phase;
+     * we just don't retry or wait for posted-write completion because the
+     * target's debug domain drops sync as soon as SYSRESETREQ fires. Capture
+     * both ACKs in g_result[19] so a silent "reset never went out" is visible
+     * in SRAM rather than looking identical to a successful reset. */
+    uint32_t aircr_tar_ack = swd_write_txn(1, 0b01, TGT_AIRCR);
+    swd_idle(8);
+    uint32_t aircr_drw_ack = swd_write_txn(1, 0b11, TGT_AIRCR_SYSRESET);
+    swd_idle(16);
+    g_result[19] = ((aircr_tar_ack & 0xFFu) << 16) | ((aircr_drw_ack & 0xFFu) << 24);
 
     /* Idle loop */
     while (1) { __asm__ volatile("nop"); }
