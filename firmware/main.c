@@ -3,16 +3,26 @@
    Runs SWD master at ~MHz (not kHz like J-Link proxied).
    Results written to SRAM so J-Link can read them back without UART.
 
-   SRAM layout at g_result[0..15] (0x20000000 + offset):
-     [0] marker      0xBEEF0001 (firmware started)
-     [1] idcode_ack  SWD ACK for IDCODE read  (expect 0x1 = OK)
-     [2] idcode      DP IDCODE                (expect 0x0BB11477)
-     [3] abort_ack   SWD ACK for ABORT write  (expect 0x1 = OK)
-     [4] select_ack  SWD ACK for SELECT write (expect 0x1 = OK)
-     [5] ctrl_ack    SWD ACK for CTRL/STAT W  (expect 0x1 = OK)
-     [6] ctrl_read_ack  SWD ACK for CTRL/STAT R (expect 0x1 = OK)
-     [7] ctrlstat    CTRL/STAT read-back      (expect bits 31,29,30,28 set = 0xF0000000)
-     [8] marker_end  0xBEEFDEAD (sequence finished)
+   SRAM layout at g_result[0..19] (0x20000000 + offset):
+     [0]  marker          0xBEEF0001 (firmware started)
+     [1]  idcode_ack      ACK for DP IDCODE read (expect 0x1 = OK)
+     [2]  idcode          DP IDCODE (expect 0x0BB11477)
+     [3]  abort_ack       ACK for DP ABORT write
+     [4]  select_ack      ACK for DP SELECT = 0 write
+     [5]  ctrlstat        CTRL/STAT readback (expect 0xF0000040 = power up + READOK)
+     [6]  select_f0_ack   ACK for SELECT APBANKSEL=0xF
+     [7]  ap_posted_stale first posted AP read (discard)
+     [8]  ap_idr          AHB-AP IDR (expect ARM signature, e.g. 0x04770021)
+     [9]  csw_readback    CSW after our write (expect 0x03000042)
+     [10] sram_wr_acks    packed ACKs from SRAM write (TAR<<16 | DRW<<8)
+     [11] sram_readback   SRAM roundtrip value (expect 0xDEADBEEF)
+     [12] sram_rd_acks    packed ACKs from SRAM read
+     [13] flash_cr_locked FLASH_CR before unlock (expect bit 7 = LOCK set)
+     [14] flash_cr_unlocked FLASH_CR after unlock (expect bit 7 = 0)
+     [15] sr_after_erase  FLASH_SR after page erase (expect EOP bit 5 set)
+     [16] flash_readback  Flash[0] after program (expect 0xFFFF1234)
+     [17] sr_after_program FLASH_SR after halfword program
+     [18..19] reserved
 */
 #include <stdint.h>
 
@@ -28,8 +38,9 @@
 #define SWDIO_MASK  (1u << SWDIO_PIN)
 #define SWCLK_MASK  (1u << SWCLK_PIN)
 
-/* Results — placed in .bss, accessible via J-Link at 0x20000000 + offset */
-volatile uint32_t g_result[16] __attribute__((used));
+/* Results — placed in .bss, accessible via J-Link at 0x20000000 + offset.
+   Slots 13+ were colliding in the earlier monolithic version; expanded to 20. */
+volatile uint32_t g_result[20] __attribute__((used));
 
 /* ---------- low-level GPIO + SWD bit-bang ---------- */
 
@@ -324,7 +335,7 @@ int main(void) {
         sr_erase = swd_ap_mem_read(0x4002200C, &at, &ad, &ar);
         if ((sr_erase & 1) == 0) break;
     }
-    g_result[13] = sr_erase;   /* expect EOP=bit5=1, BSY=0 */
+    g_result[15] = sr_erase;   /* expect EOP=bit5=1, BSY=0 */
 
     /* Clear CR */
     swd_write_txn(1, 0b01, 0x40022010);
@@ -363,10 +374,10 @@ int main(void) {
     swd_idle(8);
 
     /* 14. Read Flash[0] back — expect 0xFFFF1234 (0x1234 in low halfword, erased 0xFFFF upper) */
-    g_result[14] = swd_ap_mem_read(0x08000000, &at, &ad, &ar);
+    g_result[16] = swd_ap_mem_read(0x08000000, &at, &ad, &ar);
 
     /* 15. Final FLASH_SR */
-    g_result[15] = sr_prog;
+    g_result[17] = sr_prog;
 
     /* Idle loop */
     while (1) { __asm__ volatile("nop"); }
