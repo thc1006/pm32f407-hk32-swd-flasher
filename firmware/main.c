@@ -121,6 +121,9 @@ static uint8_t swd_request(int apndp, int rnw, int addr23) {
 #define SWD_MAX_WAIT_RETRIES        8
 #define SWD_WAIT_RETRY_IDLE_CYCLES  4   /* brief idle between WAIT retries */
 
+/* Forward decl: DP ABORT helper used by FAULT-recovery branches below. */
+static uint32_t swd_abort_clear_stickies_raw(void);
+
 /* Internal: single SWD read attempt (no retry). On non-OK ACK, the 32 data
    bits clocked after ACK are not meaningful per ADIv5, so we leave *data_out
    unchanged — avoids leaking undefined bits to callers that forget to gate
@@ -143,15 +146,29 @@ static uint32_t swd_read_txn_once(int apndp, int addr23, uint32_t *data_out) {
     return ack;
 }
 
-/* SWD read with WAIT retry per ADIv5 §B4.2.1. WAIT means "target busy,
-   retry the same request". Short-circuit on OK / FAULT. */
+/* SWD read with WAIT retry (ADIv5 §B4.2.1) + FAULT recovery (ABORT clear-
+   stickies + one retry, same H2 semantics we apply on the write path). A
+   read is just as able to wedge the session on FAULT as a write — without
+   recovery here the next AP access would also FAULT regardless of the
+   stickies getting cleared on the write side. */
 static uint32_t swd_read_txn(int apndp, int addr23, uint32_t *data_out) {
+    int fault_recovery_left = 1;
     for (int i = 0; i < SWD_MAX_WAIT_RETRIES; i++) {
         uint32_t ack = swd_read_txn_once(apndp, addr23, data_out);
-        if (ack != SWD_ACK_WAIT) return ack;
-        /* Brief idle before retrying so target can finish internal bookkeeping */
-        swdio_output(); swdio_low();
-        for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+        if (ack == SWD_ACK_OK) return ack;
+        if (ack == SWD_ACK_FAULT && fault_recovery_left > 0) {
+            fault_recovery_left--;
+            (void)swd_abort_clear_stickies_raw();
+            swdio_output(); swdio_low();
+            for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+            continue;
+        }
+        if (ack == SWD_ACK_WAIT) {
+            swdio_output(); swdio_low();
+            for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+            continue;
+        }
+        return ack;
     }
     return SWD_ACK_WAIT;
 }
@@ -175,16 +192,43 @@ static uint32_t swd_write_txn_raw(int apndp, int addr23, uint32_t wire_data, int
     return ack;
 }
 
-/* Convenience: target.DATA = `data` with shift-compensation + retry on WAIT. */
+/* DP ABORT write to clear sticky error flags. Must use the raw primitive
+   (not swd_write_txn) to avoid infinite recursion when called from the
+   FAULT-recovery paths of swd_read_txn / swd_write_txn. Returns the ABORT
+   write's own ACK so callers can observe when the recovery itself failed. */
+static uint32_t swd_abort_clear_stickies_raw(void) {
+    /* data = 0x1E = STKCMPCLR(bit 1) | STKERRCLR(2) | WDERRCLR(3) | ORUNERRCLR(4) */
+    const uint32_t data = 0x0000001Eu;
+    uint32_t wire_data = (data & 0x7FFFFFFFu) << 1;
+    int parity_bit = (int)((data >> 31) & 1u);
+    int real_parity = parity32(data);
+    return swd_write_txn_raw(0, 0b00, wire_data, parity_bit, real_parity);
+}
+
+/* Convenience: target.DATA = `data` with shift-compensation, WAIT retry,
+   and FAULT recovery (clear stickies + one retry). */
 static uint32_t swd_write_txn(int apndp, int addr23, uint32_t data) {
     uint32_t wire_data = (data & 0x7FFFFFFF) << 1;
     int parity_bit = (data >> 31) & 1;
     int real_parity = parity32(data);
+    int fault_recovery_left = 1;
     for (int i = 0; i < SWD_MAX_WAIT_RETRIES; i++) {
         uint32_t ack = swd_write_txn_raw(apndp, addr23, wire_data, parity_bit, real_parity);
-        if (ack != SWD_ACK_WAIT) return ack;
-        swdio_output(); swdio_low();
-        for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+        if (ack == SWD_ACK_OK) return ack;
+        if (ack == SWD_ACK_FAULT && fault_recovery_left > 0) {
+            /* Try once more after explicitly clearing STICKYERR/WDATAERR/etc. */
+            fault_recovery_left--;
+            (void)swd_abort_clear_stickies_raw();
+            swdio_output(); swdio_low();
+            for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+            continue;
+        }
+        if (ack == SWD_ACK_WAIT) {
+            swdio_output(); swdio_low();
+            for (int j = 0; j < SWD_WAIT_RETRY_IDLE_CYCLES; j++) swd_clk();
+            continue;
+        }
+        return ack;   /* FAULT without recovery budget, or garbage ACK */
     }
     return SWD_ACK_WAIT;
 }
