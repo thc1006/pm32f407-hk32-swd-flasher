@@ -52,6 +52,10 @@
 #define TGT_DHCSR_C_DEBUGEN (1u << 0)
 #define TGT_DHCSR_S_HALT    (1u << 17)  /* RO: core currently halted */
 
+/* SCB AIRCR — system reset request (ARMv7-M / M0 both support this) */
+#define TGT_AIRCR           0xE000ED0C
+#define TGT_AIRCR_SYSRESET  0x05FA0004  /* VECTKEY(0x05FA<<16) | SYSRESETREQ(bit 2) */
+
 /* ARM ADIv5 expected constants */
 #define EXPECTED_DP_IDCODE  0x0BB11477  /* Cortex-M0 SW-DP v1 */
 
