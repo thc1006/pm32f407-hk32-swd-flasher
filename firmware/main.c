@@ -114,8 +114,14 @@ static uint8_t swd_request(int apndp, int rnw, int addr23) {
                      (a2 << 3) | (a3 << 4) | (p << 5) | (0 << 6) | (1 << 7));
 }
 
-/* SWD read: returns ACK (3-bit LSB-first) and *data populated on OK */
-static uint32_t swd_read_txn(int apndp, int addr23, uint32_t *data_out) {
+/* ACK values (LSB-first encoded, per ARM ADIv5 §B4.2.2) */
+#define SWD_ACK_OK      0x1
+#define SWD_ACK_WAIT    0x2
+#define SWD_ACK_FAULT   0x4
+#define SWD_MAX_WAIT_RETRIES 8
+
+/* Internal: single SWD read attempt (no retry). */
+static uint32_t swd_read_txn_once(int apndp, int addr23, uint32_t *data_out) {
     uint8_t req = swd_request(apndp, 1, addr23);
     swdio_output();
     swd_write_bits_lsb(req, 8);
@@ -129,6 +135,19 @@ static uint32_t swd_read_txn(int apndp, int addr23, uint32_t *data_out) {
     swd_clk();
     *data_out = data;
     return ack;
+}
+
+/* SWD read with WAIT retry per ADIv5 §B4.2.1. WAIT means "target busy,
+   retry the same request". Short-circuit on OK / FAULT. */
+static uint32_t swd_read_txn(int apndp, int addr23, uint32_t *data_out) {
+    for (int i = 0; i < SWD_MAX_WAIT_RETRIES; i++) {
+        uint32_t ack = swd_read_txn_once(apndp, addr23, data_out);
+        if (ack != SWD_ACK_WAIT) return ack;
+        /* Brief idle before retrying so target can finish internal bookkeeping */
+        swdio_output(); swdio_low();
+        for (int j = 0; j < 4; j++) swd_clk();
+    }
+    return SWD_ACK_WAIT;
 }
 
 /* SWD write — shift-compensated with TRUE parity bit at end.
@@ -150,11 +169,18 @@ static uint32_t swd_write_txn_raw(int apndp, int addr23, uint32_t wire_data, int
     return ack;
 }
 
+/* Convenience: target.DATA = `data` with shift-compensation + retry on WAIT. */
 static uint32_t swd_write_txn(int apndp, int addr23, uint32_t data) {
     uint32_t wire_data = (data & 0x7FFFFFFF) << 1;
     int parity_bit = (data >> 31) & 1;
     int real_parity = parity32(data);
-    return swd_write_txn_raw(apndp, addr23, wire_data, parity_bit, real_parity);
+    for (int i = 0; i < SWD_MAX_WAIT_RETRIES; i++) {
+        uint32_t ack = swd_write_txn_raw(apndp, addr23, wire_data, parity_bit, real_parity);
+        if (ack != SWD_ACK_WAIT) return ack;
+        swdio_output(); swdio_low();
+        for (int j = 0; j < 4; j++) swd_clk();
+    }
+    return SWD_ACK_WAIT;
 }
 
 static void swd_idle(int n) {
