@@ -166,7 +166,7 @@ static void swd_idle(int n) {
 /* AP memory read — canonical ADIv5 "post + RDBUFF" pattern.
    1) Write AP TAR with target address.
    2) Read AP DRW — posts the memory fetch; returned data is from the PREVIOUS
-      AP access (stale / zero on first call of a session).
+      AP access (stale / undefined on first access of a session per ADIv5).
    3) Read DP RDBUFF — returns the just-fetched value WITHOUT triggering a new
       AP access. This is what we want for point reads.
    Older versions of this function did a second AP DRW read instead, which
