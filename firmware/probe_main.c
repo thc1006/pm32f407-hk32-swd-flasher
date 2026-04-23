@@ -366,79 +366,8 @@ int main(void) {
             uart_puts(" ack=");
             uart_putc((char)('0' + (a & 7)));
             uart_puts("\r\n");
-        } else if (cmd == 'S' || cmd == 's') {
-            /* Open-loop 6-step commutation via SWD. Caller must first:
-             *   - Halt target (H) so vendor FSM doesn't fight us
-             *   - Ensure TPOE=1 on target ATU (manual write to TPPS)
-             * We inject into the already-configured ATU (period, dead-time,
-             * output mode set by vendor demo's init code). We just rewrite
-             * CR0A/B, CR1A/B, CR2A/B each step to commutate phases.
-             *   S <hex_revs> <hex_step_delay_nops>
-             * Typical safe starter: S 64 30D40  (100 revs, ~60ms/step). */
-            uint32_t revs = parse_hex(&rest);
-            uint32_t delay_nops = parse_hex(&rest);
-            if (revs == 0) revs = 100;
-            if (delay_nops == 0) delay_nops = 200000;
-
-            /* REVERSED 6-step table — vendor chip U/V/W label may not match
-             * B1044 motor cable U/V/W; reverse order swaps rotation direction.
-             * Moderate differential (70/30) for thermal safety. */
-            static const uint32_t step_table[6][3] = {
-                { 750,  450, 1050},
-                { 450,  750, 1050},
-                { 450, 1050,  750},
-                { 750, 1050,  450},
-                {1050,  750,  450},
-                {1050,  450,  750},
-            };
-            uart_puts("S start\r\n");
-            for (uint32_t r = 0; r < revs; r++) {
-                for (int st = 0; st < 6; st++) {
-                    uint32_t u = step_table[st][0];
-                    uint32_t v = step_table[st][1];
-                    uint32_t w = step_table[st][2];
-                    /* Complementary: write BOTH A and B with same value.
-                     * Dead-time handled by ATU's DBTA/DBTB (set by vendor). */
-                    swd_write_txn(1, 0b01, 0x40004408u); swd_idle(2);  /* CR0A */
-                    swd_write_txn(1, 0b11, u);           swd_idle(2);
-                    swd_write_txn(1, 0b01, 0x40004420u); swd_idle(2);  /* CR0B */
-                    swd_write_txn(1, 0b11, u);           swd_idle(2);
-                    swd_write_txn(1, 0b01, 0x4000440Cu); swd_idle(2);  /* CR1A */
-                    swd_write_txn(1, 0b11, v);           swd_idle(2);
-                    swd_write_txn(1, 0b01, 0x40004424u); swd_idle(2);  /* CR1B */
-                    swd_write_txn(1, 0b11, v);           swd_idle(2);
-                    swd_write_txn(1, 0b01, 0x40004410u); swd_idle(2);  /* CR2A */
-                    swd_write_txn(1, 0b11, w);           swd_idle(2);
-                    swd_write_txn(1, 0b01, 0x40004428u); swd_idle(2);  /* CR2B */
-                    swd_write_txn(1, 0b11, w);           swd_idle(2);
-                    for (volatile uint32_t d = delay_nops; d; d--) {
-                        __asm__ volatile("nop");
-                    }
-                }
-            }
-            /* Neutral (50/50) */
-            for (int ch = 0; ch < 3; ch++) {
-                swd_write_txn(1, 0b01, 0x40004408u + ch*4); swd_idle(2);
-                swd_write_txn(1, 0b11, 750);                swd_idle(2);
-                swd_write_txn(1, 0b01, 0x40004420u + ch*4); swd_idle(2);
-                swd_write_txn(1, 0b11, 750);                swd_idle(2);
-            }
-            uart_puts("S done\r\n");
-        } else if (cmd == 'E' || cmd == 'e') {
-            /* Enable TPOE (PWM output) via TRWPT-unlocked TPPS write. */
-            swd_write_txn(1, 0b01, 0x40004494u); swd_idle(2);
-            swd_write_txn(1, 0b11, 0x0000A5A5u); swd_idle(2);
-            uint32_t t = swd_ap_mem_read(0x40004480u, &at, &ad, &ar);
-            swd_write_txn(1, 0b01, 0x40004480u); swd_idle(2);
-            swd_write_txn(1, 0b11, t | (1u << 14)); swd_idle(2);
-            swd_write_txn(1, 0b01, 0x40004494u); swd_idle(2);
-            swd_write_txn(1, 0b11, 0x0000000Au); swd_idle(2);
-            uint32_t r = swd_ap_mem_read(0x40004480u, &at, &ad, &ar);
-            uart_puts("E tpps=");
-            uart_print_hex8(r);
-            uart_puts("\r\n");
         } else if (cmd == '?' || cmd == 0 || cmd == ' ') {
-            uart_puts("probe v2 | R|W|H|G|I | E enable PWM | S revs delay_nops\r\n");
+            uart_puts("probe v1 | R|W|H|G|I\r\n");
         } else {
             uart_puts("? unknown cmd '");
             uart_putc(cmd);

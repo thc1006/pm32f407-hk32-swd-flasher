@@ -83,143 +83,21 @@ class Probe:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "Sanity check for the PM32F407 SWD probe firmware. Opens the serial "
+            "port, reads the target's IDCODE, and prints it. PM30225V (HK32F030 "
+            "silicon) reports 0x0BB11477. For richer usage, import Probe and "
+            "script against p.r(), p.w(), p.halt(), p.go()."
+        )
+    )
     ap.add_argument("--port", default="COM3")
     ap.add_argument("--baud", default=115200, type=int)
-    ap.add_argument("cmd", nargs="?", default="snapshot")
     args = ap.parse_args()
 
     p = Probe(args.port, args.baud)
-
-    if args.cmd == "force-align-with-tpoe":
-        # Combined: neutralize VSP_Control, force ALIGN, and manually set TPOE
-        # so PWM output definitely reaches the MOSFETs even if REG_PWM_Out_Enable
-        # inside the case handler is a no-op.
-        w = p.r(0x20000024)
-        p.w(0x20000024, w & 0xFFFF0000)     # unStopLevel = 0
-        p.w(0x40004494, 0x0000A5A5)
-        tpps_new = p.r(0x40004480) | (1 << 14)
-        p.w(0x40004480, tpps_new)
-        p.w(0x40004494, 0x0000000A)
-        p.w(0x200000F0, 7)                  # eFSM = ALIGN
-        print("forced ALIGN + TPOE; watching duty response for 6s...")
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 6.0:
-            cr0 = p.r(0x40004408) & 0xFFFF
-            cr1 = p.r(0x4000440C) & 0xFFFF
-            cr2 = p.r(0x40004410) & 0xFFFF
-            fsm = p.r(0x200000F0) & 0xFF
-            tpps = p.r(0x40004480)
-            tpoe = (tpps >> 14) & 1
-            print(f"  t={time.monotonic()-t0:5.2f}s  eFSM={fsm}  TPOE={tpoe}  duties=({cr0} {cr1} {cr2})")
-            time.sleep(0.3)
-        return 0
-
-    if args.cmd == "force-tpoe":
-        # Directly set ATU.TPPS bit 14 (TPOE = master PWM output enable)
-        # via SWD, replicating what REG_PWM_Out_Enable does:
-        #   ATU->TRWPT = 0xA5A5    (unlock protected regs)
-        #   ATU->TPPS  |= (1<<14)
-        #   ATU->TRWPT = 0xA       (relock)
-        tpps_before = p.r(0x40004480)
-        tpoe_before = (tpps_before >> 14) & 1
-        print(f"before: TPPS={tpps_before:#010x}  TPOE={tpoe_before}")
-        p.w(0x40004494, 0x0000A5A5)    # TRWPT unlock
-        # read-modify-write TPPS
-        tpps_rmw = p.r(0x40004480) | (1 << 14)
-        p.w(0x40004480, tpps_rmw)
-        p.w(0x40004494, 0x0000000A)    # TRWPT relock
-        tpps_after = p.r(0x40004480)
-        tpoe_after = (tpps_after >> 14) & 1
-        print(f"after:  TPPS={tpps_after:#010x}  TPOE={tpoe_after}")
-        if tpoe_after == 0:
-            print("!! TPOE write did not stick — protection still blocking or wrong reg")
-        else:
-            print("PWM output enabled — motor should twitch/spin if FOC is commanding duty != 50%")
-        # Dump duties
-        cr0a = p.r(0x40004408) & 0xFFFF
-        cr1a = p.r(0x4000440C) & 0xFFFF
-        cr2a = p.r(0x40004410) & 0xFFFF
-        tpr = p.r(0x40004400) & 0xFFFF
-        print(f"TPR={tpr}  CR0A={cr0a} ({100*cr0a/tpr:.1f}%)  CR1A={cr1a} ({100*cr1a/tpr:.1f}%)  CR2A={cr2a} ({100*cr2a/tpr:.1f}%)")
-        return 0
-
-    if args.cmd == "force-align":
-        # Keep VSP_Control from slamming us back to SOFTSTOP.
-        w = p.r(0x20000024)
-        p.w(0x20000024, w & 0xFFFF0000)    # unStopLevel = 0
-        # eFSM = E_FSM_SYS_ALIGN (7): handler calls MotorAlign + REG_PWM_Out_Enable
-        p.w(0x200000F0, 7)
-        print("forced eFSM=ALIGN; watching for PWM enable + motor twitch...")
-        t0 = time.monotonic()
-        last_tpoe = -1
-        last_fsm = -1
-        while time.monotonic() - t0 < 8.0:
-            fsm = p.r(0x200000F0) & 0xFF
-            tpps = p.r(0x40004480)
-            tpoe = (tpps >> 14) & 1
-            cr0a = p.r(0x40004408) & 0xFFFF
-            cr1a = p.r(0x4000440C) & 0xFFFF
-            cr2a = p.r(0x40004410) & 0xFFFF
-            if tpoe != last_tpoe or fsm != last_fsm:
-                print(f"  t={time.monotonic()-t0:5.2f}s  eFSM={fsm}  TPOE={tpoe}  CR0A={cr0a} CR1A={cr1a} CR2A={cr2a}")
-                last_tpoe = tpoe
-                last_fsm = fsm
-            time.sleep(0.05)
-        return 0
-
-    if args.cmd == "force-start":
-        # Motor demo's VSP_Control polls at 100 Hz:
-        #   if VspCommand > unStartLevel → STANDBY → DET
-        #   if VspCommand < unStopLevel  → (not STANDBY/INIT/BRAKE) → SOFTSTOP
-        # With unVspCommand stuck at 0 (VSP ADC reads 0), we fall into the
-        # second branch → any forced eFSM gets slammed back to SOFTSTOP within
-        # 10 ms. Defeat that by zeroing unStopLevel first, then forcing eFSM.
-        w = p.r(0x20000024)
-        factor = w & 0xFFFF0000  # preserve unFactor in high half
-        p.w(0x20000024, factor)  # unStopLevel = 0
-        print(f"unStopLevel zeroed; word @ 0x20000024 now = {p.r(0x20000024):#010x}")
-        # Force eFSM = E_FSM_SYS_DET (5)
-        p.w(0x200000F0, 5)
-        print(f"eFSM forced to DET; word @ 0x200000F0 now = {p.r(0x200000F0):#010x}")
-        # Watch for 5 seconds — sample state machine and PWM enable bit.
-        print("watching state... (5 sec)")
-        t0 = time.monotonic()
-        last_fsm = -1
-        last_tpps = -1
-        while time.monotonic() - t0 < 5.0:
-            fsm = p.r(0x200000F0) & 0xFF
-            tpps = p.r(0x40004480)
-            if fsm != last_fsm or (tpps & (1 << 14)) != (last_tpps & (1 << 14)):
-                moe = "ON" if (tpps & (1 << 14)) else "off"
-                cr0a = p.r(0x40004408) & 0xFFFF
-                cnt = p.r(0x40004404) & 0xFFFF
-                print(f"  t={time.monotonic()-t0:5.2f}s  eFSM={fsm}  TPPS={tpps:#010x} PWM={moe}  CR0A={cr0a}  CNT={cnt}")
-                last_fsm = fsm
-                last_tpps = tpps
-            time.sleep(0.05)
-        return 0
-
-    if args.cmd == "snapshot":
-        print(f"IDCODE            = {p.idcode():#010x}")
-        print(f"eFSM              = {p.r(0x200000F0):#010x}   (1=INIT 2=STANDBY 3=STOP 4=RUN 5=DET 6=RAMP 7=ALIGN)")
-        w = p.r(0x200000F8)
-        print(f"eSYSPROTECT packed = {w:#010x}")
-        w = p.r(0x20000028)
-        vsp_cmd = w & 0xFFFF
-        print(f"gS_VSP.unVspCommand = {vsp_cmd:#06x} = {vsp_cmd}  (threshold unStartLevel=568)")
-        w = p.r(0x200000EC)
-        vsp_raw = w & 0xFFFF
-        is_raw = (w >> 16) & 0xFFFF
-        print(f"u16ADCValue[3] VSP_raw = {vsp_raw}   u16ADCValue[4] IS_raw = {is_raw}")
-        w = p.r(0x200000E8)
-        iv_raw = w & 0xFFFF
-        vbus_raw = (w >> 16) & 0xFFFF
-        print(f"u16ADCValue[1] IV_raw  = {iv_raw}   u16ADCValue[2] VBUS_raw = {vbus_raw}")
-        print(f"ATU.TPPS          = {p.r(0x40004480):#010x}   (bit 14 TPOE = master PWM enable)")
-        print(f"ATU.CNT           = {p.r(0x40004404):#010x}")
-        print(f"ATU.CR0A          = {p.r(0x40004408):#010x}")
-
+    idcode = p.idcode()
+    print(f"IDCODE = {idcode:#010x}")
     return 0
 
 
