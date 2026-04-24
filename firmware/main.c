@@ -1,9 +1,10 @@
-/* PM32F407 SWD programmer - MILESTONE 3
+/* PM32F407 SWD programmer
    Port of swd_bitbang_via_jlink.py to native C on PM32F407.
-   Runs SWD master at ~MHz (not kHz like J-Link proxied).
-   Results written to SRAM so J-Link can read them back without UART.
+   Runs SWD master at ~1 MHz (versus ~kHz when proxied through J-Link).
+   Results written to SRAM so J-Link, the probe firmware (firmware/probe_main.c),
+   or any other SWD master can read them back without needing the UART path.
 
-   SRAM layout at g_result[0..19] (0x20000000 + offset):
+   SRAM layout at g_result[0..23] (0x20000000 + offset):
      [0]  marker          0xBEEF0001 (firmware started)
      [1]  idcode_ack      ACK for DP IDCODE read (expect 0x1 = OK)
      [2]  idcode          DP IDCODE (expect 0x0BB11477)
