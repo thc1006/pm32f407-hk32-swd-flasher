@@ -329,11 +329,22 @@ static uint32_t flash_erase_page(uint32_t page_addr, int *bsy_cleared) {
 
 /* Program one halfword. CSW must already be HALFWORD. Leaves CR zeroed. */
 static uint32_t flash_program_hw(uint32_t addr, uint16_t hw, int *bsy_cleared) {
+    /* AHB-AP halfword byte-lane rule: when CSW size=halfword, the active byte
+     * lane is selected by addr[1:0]. For an address with bit 1 set (odd
+     * halfword offset within a word), the payload must sit in DRW[31:16];
+     * otherwise the target receives 0x0000 on that lane and every upper
+     * halfword of every word gets silently zeroed. This bug survived the
+     * AP verify loop because the verify read uses the same CSW mode and
+     * gets the same lane back — a classic "wrote 0, read 0, no mismatch"
+     * false-positive. Symptom on HK32F030: target Flash ends up with every
+     * high halfword = 0 including the reset vector, so CPU hard-faults on
+     * first instruction and Q_Example never boots. */
+    uint32_t drw_val = (addr & 2u) ? ((uint32_t)hw << 16) : (uint32_t)hw;
     swd_write_txn(1, 0b01, TGT_FLASH_CR);
     swd_write_txn(1, 0b11, TGT_FLASH_CR_PG);
     swd_idle(8);
     swd_write_txn(1, 0b01, addr);
-    swd_write_txn(1, 0b11, (uint32_t)hw);
+    swd_write_txn(1, 0b11, drw_val);
     swd_idle(8);
     uint32_t sr = flash_poll_sr_until_not_bsy(bsy_cleared);
     swd_write_txn(1, 0b01, TGT_FLASH_CR);
@@ -411,8 +422,13 @@ int main(void) {
     ack = swd_write_txn(0, 0b10, 0x00000000);  /* SELECT back to bank 0 */
     swd_idle(16);
 
-    /* 7. Write AP CSW = 0x00000002 (word size, no auto-inc) */
-    ack = swd_write_txn(1, 0b00, 0x00000002);
+    /* 7. Write AP CSW: word size | MasterType | HPROT | DeviceEn.
+     * The upper bits 24 (MasterType) and 25 (HPROT master-like) are required
+     * for some AHB-AP implementations to actually issue memory transactions;
+     * bit 6 (DeviceEn) gates the memory port. Writing just 0x02 (size only)
+     * leaves these three bits clear and the AP silently drops transfers on
+     * HK32F030's port. 0x03000042 = Size=Word | DeviceEn | MasterType | HPROT. */
+    ack = swd_write_txn(1, 0b00, 0x03000042);
     swd_idle(16);
 
     /* 8. Read AP CSW to verify */
@@ -525,8 +541,11 @@ int main(void) {
         g_result[16] = 0xDEADDEADu;
         g_result[17] = 0xDEADDEADu;
     } else {
-        /* 13. Switch AP CSW to HALFWORD — STM32F0 requires halfword program. */
-        swd_write_txn(1, 0b00, 0x00000001);
+        /* 13. Switch AP CSW to HALFWORD — STM32F0 requires halfword program.
+         * 0x03000041 = Size=Halfword | DeviceEn | MasterType | HPROT,
+         * preserving the context bits from step 7. Writing bare 0x01 again
+         * clears them and memory transfers silently drop. */
+        swd_write_txn(1, 0b00, 0x03000041);
         swd_idle(8);
 
         /* 14. Loop halfword-program across blob. Each halfword is composed
@@ -547,8 +566,8 @@ int main(void) {
             }
         }
 
-        /* Switch CSW back to WORD for readback */
-        swd_write_txn(1, 0b00, 0x00000002);
+        /* Switch CSW back to WORD for readback (preserve MasterType/HPROT/DeviceEn). */
+        swd_write_txn(1, 0b00, 0x03000042);
         swd_idle(8);
 
         g_result[17] = sr_prog;
