@@ -37,6 +37,9 @@ Usage examples:
     python tools/demo_direct_drive.py --reverse --seconds 18
     python tools/demo_direct_drive.py --duty 95 --step-ms 40 --seconds 24
     python tools/demo_direct_drive.py --stop                # neutralise + TPOE off only
+    python tools/demo_direct_drive.py --reset-mcu           # reset PM32F407 before driving;
+                                                            # use this if IDCODE reads 0 because
+                                                            # the target was power-cycled mid-session
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ import time
 
 sys.path.insert(0, "tools")
 from probe import Probe  # noqa: E402
+from reset_pm32f407 import reset_pm32f407  # noqa: E402
 
 # PM30225V ATU (MMIO). Offsets match pm30225q_0405b.h ATU_TypeDef — same
 # layout as the V and MY-i variants we audited.
@@ -132,10 +136,22 @@ def main() -> int:
                     help="reverse commutation order (flips rotation direction)")
     ap.add_argument("--stop", action="store_true",
                     help="neutralise duties + clear TPOE, then exit (safety reset)")
+    ap.add_argument("--reset-mcu", action="store_true",
+                    help="reset PM32F407 via DTR/RTS before connecting (use when "
+                         "IDCODE reads 0 because the target was power-cycled mid-session)")
     args = ap.parse_args()
 
+    if args.reset_mcu:
+        reset_pm32f407(args.port, args.baud)
+        print(f"PM32F407 reset on {args.port}")
+
     p = Probe(args.port, args.baud)
-    print(f"IDCODE = {p.idcode():#010x}")
+    idcode = p.idcode()
+    if idcode != 0x0BB11477:
+        print(f"WARNING: IDCODE = {idcode:#010x} (expected 0x0BB11477). "
+              f"Run with --reset-mcu, or check 12V on KXB and SWD wires.")
+        return 2
+    print(f"IDCODE = {idcode:#010x}  OK")
 
     if args.stop:
         disable_pwm(p)
