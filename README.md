@@ -6,14 +6,20 @@ Why this exists: the PM30225V is a HK32F030 motor-driver IC with an STM32F030-cl
 
 ## Status
 
-Verified end-to-end on 2026-04-22:
+Initial end-to-end verification on 2026-04-22:
 
 - ARM ADIv5 SWD protocol (DP + AP transactions)
 - Debug power-up via CTRL/STAT (`0xF0000040` readback)
 - Arbitrary target memory read/write (SRAM roundtrip of `0xDEADBEEF`)
 - Flash unlock, erase, program, verify (halfword `0x1234` at `0x08000000` → readback `0xFFFF1234`)
 
-See `docs/known_issues.md` for rough edges you should fix before using this in anything serious.
+**2026-04-25 — path C motor rotation achieved**, after fixing a silent Flash corruption bug that had been masquerading as clean verify (PR #14 — halfword byte-lane + CSW context bits) and a page-size bug specific to HK32F030 (PR #12 — 0x200 not 0x400):
+
+- Full vendor-demo blob (10.8 KB `PM30225Q_0405B_2R_Example`) flashed and boots cleanly
+- Target CPU halted + `ATU.TPPS.TPHMS | TPOE` set via TRWPT unlock + 6-step CR*A/B commutation via SWD drives B1044 BLDC motor on KXB EVB both directions, no J-Link involvement end-to-end
+- Interactive SWD probe firmware (PR #13) + Python host client (PR #13 / PR #15) used throughout for live SRAM inspection and issuing the halt + commutation commands
+
+See `docs/known_issues.md` for remaining rough edges (mostly Medium-priority polish; all C1–H5 and byte-lane/CSW critical fixes are merged on main). See the **Motor rotation demo** section below for the USB-only reproduction recipe.
 
 ## Hardware wiring
 
