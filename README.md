@@ -84,6 +84,83 @@ docs/
   swd_quirks.md   HK32F030 SWD quirks we had to work around
 ```
 
+## Motor rotation demo (no J-Link required)
+
+Once the flasher has loaded a working vendor demo into PM30225V you can drive
+the motor directly over SWD without depending on the vendor's closed-source
+FOC startup. Validated 2026-04-25 on PM30225V + B1044 + 1:125 gearbox using
+`PM30225Q_0405B_2R_Example` (the KXB-matched variant — see `swd_quirks.md`
+for why the other variants don't work).
+
+### One-time setup
+
+1. Flash the **probe firmware** to PM32F407. Either:
+   - via J-Link: `cp firmware/probe_main.c firmware/main.c && python tools/build.py`
+     then `JLink.exe -device STM32F407ZG -CommandFile tools/jlink/deploy.jlink`
+   - or via USB ROM bootloader: `stm32loader -p COM4 -V firmware/build/fw.bin`
+     (requires `pip install stm32loader`; the EVB's CH340C wires DTR→BOOT0
+     and RTS→NRST, so ESP-style auto-ISP works)
+
+2. Wire SWD between PM32F407 and KXB EVB:
+   ```
+   PM32F407 PC0 ─→ KXB P3 SWDIO
+   PM32F407 PC2 ─→ KXB P3 SWCLK
+   PM32F407 GND ─→ KXB P3 GND
+   ```
+
+3. Power KXB: 9–12 V to P1 Pin 5 (VIN). Pull P4 Pin 5 (PA11 = VSP ADC) to
+   VDD or a pot — without a non-zero VSP the vendor FSM never leaves STANDBY,
+   though our halt-mode drive bypasses this anyway.
+
+### Drive the motor
+
+```bash
+python tools/demo_direct_drive.py --port COM4 --reset-mcu --seconds 18
+# 18 s of stable forward rotation at 85/15 duty, 30 ms/step
+
+python tools/demo_direct_drive.py --port COM4 --reset-mcu --reverse --seconds 18
+# reverse direction
+
+python tools/demo_direct_drive.py --port COM4 --duty 95 --step-ms 40 --seconds 24
+# stronger torque (~+30%), useful for loaded tests like a tendon pull
+```
+
+`--reset-mcu` issues an ESP-style DTR/RTS reset on the PM32F407 EVB so the
+probe firmware re-runs its SWD line-reset / IDCODE / DP power-up. Use it
+whenever the target was power-cycled mid-session and `IDCODE` suddenly
+reads `0x00000000`.
+
+### Standalone reset utility
+
+```bash
+python tools/reset_pm32f407.py --port COM4 --verify
+# resets PM32F407, then opens probe and reads IDCODE — should print 0x0BB11477
+```
+
+### What the demo actually does
+
+`tools/demo_direct_drive.py` is open-loop trapezoidal 6-step BLDC commutation
+driven entirely from this side of SWD:
+
+```
+halt(target)                            # Cortex-M0 C_HALT via DHCSR
+TPPS |= TPHMS | TPOE                    # ATU keeps PWM alive while halted +
+                                        # enable master output (TRWPT-protected)
+loop 6 steps × N cycles:
+    write CR0A/B, CR1A/B, CR2A/B        # phase duty registers, complementary
+```
+
+It deliberately bypasses the vendor's closed-source `MotorAlign` /
+`MotorRamp` / FOC observer chain. That chain has a startup race on KXB +
+B1044 (ALIGN ↔ STOP loop, signed-s16 OCP-threshold pitfall, ParameterInit
+restoring patches every cycle) that couldn't be unwound without rebuilding
+`PM30225_LIB_V1P4.lib`. Direct ATU drive runs around the whole problem:
+the ATU peripheral was already initialised by the vendor's boot code, we
+just take over the duty registers.
+
+See PR #14 commit message for the byte-lane bug that had been silently
+corrupting every Q_Example flash before this approach could work.
+
 ## License
 
 MIT — see `LICENSE`.
