@@ -42,7 +42,7 @@
 
 /* Memory regions */
 #define TGT_FLASH_USER_BASE 0x08000000
-#define TGT_FLASH_PAGE_SIZE 0x400       /* 1 KB per page on F0/HK32 family */
+#define TGT_FLASH_PAGE_SIZE 0x200       /* HK32F030 clone is 512-byte pages (NOT 1024 like genuine STM32F030) — verified 2026-04-23 empirically */
 #define TGT_SRAM_BASE       0x20000000
 
 /* Cortex-M0 debug registers (reachable via AHB-AP once CTRL/STAT powered up) */
